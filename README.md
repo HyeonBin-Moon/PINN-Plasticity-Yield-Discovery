@@ -26,21 +26,21 @@ correlation (DIC) provide displacements, but neither stress fields nor yield sur
 This framework identifies the yield function as a mechanically constrained constitutive component
 **inside** elastoplastic stress integration, rather than through direct stress-space supervision.
 Training requires **no** stress observations, plastic strain measurements, direct yield surface
-data, or a prescribed parametric yield function.
+data, or a prescribed functional form of the yield function.
 
 The framework consists of three components:
 
 - **Convex neural representation.**
   An input convex neural network represents the yield function, enforcing **convexity** and
   **positive homogeneity of degree one** by construction through ReLU activations, removal of bias
-  terms, and a smooth nonnegative reparameterization of the recurrent weights. The assumed
-  tension–compression symmetry is imposed by symmetrizing the network output over sign reversals
-  of the normal and shear stress components.
+  terms, and a smooth nonnegative reparameterization of the hidden-to-hidden weights. The assumed
+  tension–compression symmetry and orthotropy are imposed by symmetrizing the network output over
+  sign reversals of the normal and shear stress components.
 
 - **Differentiable stress integration.**
   An explicit forward Euler elastoplastic update propagates stress from displacement-derived strain
   increments. The discontinuous plasticity indicator is replaced by a sigmoid approximation whose
-  sharpness follows an annealing schedule, keeping the stress response differentiable with respect
+  sharpness follows a prescribed schedule, keeping the stress response differentiable with respect
   to the network parameters while avoiding an implicit return-mapping solve during training.
 
 - **Physics-informed force equilibrium loss.**
@@ -81,15 +81,26 @@ forward simulation and the inverse analysis.
 
 | Quantity | Setting |
 |:--|:--|
-| Mesh | 4,485 nodes; 8,576 linear triangular plane-stress elements |
+| Mesh | 4,485 nodes; 8,576 linear triangular plane-stress elements (Abaqus CPS3, mean element size about 1.5 mm) |
 | Displacement amplitude | $\delta = 0.5$ mm |
 | Load increments | 500 per loading case |
 | Sampling interval | Every 5 increments (100 snapshots per loading case) |
 | Elastic constants | $E = 69$ GPa, $\nu = 0.3$ |
 | Hardening law | $R(\bar\varepsilon^{\,p}) = 417.501\,(0.00457 + \bar\varepsilon^{\,p})^{0.22194}$ MPa |
 
+The data files `data/Data_Inp_<model>_<case>.npz` (`<model>` in `VM`, `Hill`, `Yld2000`;
+`<case>` in `x_tension`, `y_tension`, `shear`, `biaxial`) contain the quantities used for training:
+
+| Key | Shape | Content |
+|:--|:--|:--|
+| `displacements` | (101, 4485, 3) | node label, $u_x$, $u_y$ [mm] for the initial state and the 100 sampled increments |
+| `rf_bot`, `rf_top`, `rf_right`, `rf_left` | (101, 68, 3) | node label, reaction force components [N] on the four edges |
+
+Only the total reaction forces on the displacement-controlled boundaries enter the loss. The files
+`data/Inp_<model>_<case>.inp` are the Abaqus input files with the mesh and the edge node sets.
 Stress fields, plastic strain fields, and ground-truth yield surface data are **not** used as
-training inputs; they are reserved for validation and interpretation.
+training inputs and are not part of the distributed data; the ground-truth yield functions are
+implemented in `utils/bench_models.py` for validation.
 
 ---
 
@@ -104,6 +115,9 @@ non-quadratic anisotropic yielding:
 | **Hill 1948** | Quadratic anisotropic | $F = 1.3251$, $G = 1.0730$, $H = 0.8799$, $N = 2.2014$ &nbsp;(AA6022-T4E32) |
 | **Yld2000-2d** | Non-quadratic anisotropic | $\alpha_{1\text{–}8} = 0.9835,\ 1.1182,\ 0.7435,\ 0.8517,\ 0.8879,\ 0.6511,\ 0.9790,\ 1.0810$; $a = 6$ &nbsp;(ferritic stainless steel type 409) |
 
+The benchmarks are synthetic constructions that borrow the anisotropy coefficients of the alloys
+named above while sharing one set of elastic constants and one hardening law.
+
 ---
 
 ## Training Settings
@@ -112,12 +126,14 @@ non-quadratic anisotropic yielding:
 |:--|:--:|:--|
 | Training epochs | $N_{\text{epoch}}$ | 2,000 |
 | Network architecture | — | 4 layers, 32 units per layer |
-| Optimizer | — | Adam |
+| Optimizer | — | Adam, learning rate 0.001 |
+| Weight initialization | — | Xavier uniform |
 | Loss weights | $w_c$ | $1.0$ for all loading cases |
-| Initial sharpness | $\beta_0$ | 4 |
+| Initial sharpness | $\beta_0$ | 4 MPa$^{-1}$ |
 | Sharpness update factor | $\eta_\zeta$ | 0.9, applied to $\zeta = 1/\beta$ |
 | Sharpness update period | $N_\zeta$ | 200 epochs |
 | Retained differentiation increments | $\mathcal{G}_c$ | $\{4,\ 8,\ 12,\ \dots,\ 100\}$ |
+| Random seeds | — | 1 for the network parameters, 42 for the displacement noise |
 
 > **Note on $\mathcal{G}_c$.**
 > Differentiating the flow direction $\mathbf{n}_\theta = \partial_\sigma \bar\sigma_\theta$ with
@@ -143,15 +159,79 @@ non-quadratic anisotropic yielding:
 
 - **Polynomial surrogate.**
   Fitted to 100,000 stress samples drawn on the level set of the discovered neural yield function
-  by minimizing the mean squared error against it.
+  by minimizing the mean squared error against it, with 10,000 further samples for validation
+  (20,000 epochs, Adam, learning rate $10^{-4}$ reduced to $10^{-5}$ after 1,000 epochs, gradient
+  norm clipped at 10).
 
 ---
 
 ## Repository Structure
 
+```text
+code/
+  train.py                      neural yield function identification (noise study and deep ensemble)
+  plot_results.py               yield contours of an identified yield function against the ground truth
+  fit_polynomial.py             polynomial surrogate of an identified yield function
+data/
+  Data_Inp_<model>_<case>.npz   displacement and reaction force histories (12 files)
+  Inp_<model>_<case>.inp        Abaqus input files with the mesh and boundary node sets (12 files)
+utils/
+  ai_model.py                   convex neural network (SymmetricICNN) and the polynomial surrogate model
+  discovery_plasticity_function.py   differentiable stress update, force equilibrium loss, training loop
+  bench_models.py               benchmark yield functions and the hardening law
+  load_dataset.py               readers for the mesh and the data files
+  spatiotemporal_noise.py       spatiotemporally correlated displacement noise
+  beta_scheduler.py             sharpness schedule of the sigmoid plasticity indicator
+  plot_functions.py             plotting helpers
+```
+
 ---
 
 ## Installation
+
+```bash
+pip install -r requirements.txt
+```
+
+Python 3.9 or later with NumPy, SciPy, Matplotlib, PyTorch, and SymPy (used only by
+`fit_polynomial.py`). A CUDA GPU is recommended: one identification (2,000 epochs) takes about
+50 minutes on an NVIDIA RTX 4090 and needs about 19 GB of GPU memory with the default settings.
+
+---
+
+## Usage
+
+All scripts are run from the repository root and write their outputs to `results/`, which is not
+part of the repository.
+
+Identify the yield functions of the paper:
+
+```bash
+python code/train.py --dry-run                                   # list the planned runs
+python code/train.py --yield-model VM --study noise --noise 0.0   # one noise-free identification
+python code/train.py --yield-model all --study noise              # noise study: 3 benchmarks x 4 noise levels
+python code/train.py --yield-model all --study ensemble           # deep ensemble: 3 benchmarks x seeds 1 to 10
+```
+
+Each run writes `results/<study>/<model>/<condition>/<tag>_model.pth` (network parameters, loss and
+sharpness histories, settings) together with a yield contour figure and the loss history. Existing
+checkpoints are skipped unless `--force` is given.
+
+Plot an identified yield function against its ground truth:
+
+```bash
+python code/plot_results.py --checkpoint results/noise/VM/noise_0.00e+00/VM_noise0.00e+00_model.pth --yield-model VM
+```
+
+Fit the polynomial surrogate to a noise-free identification:
+
+```bash
+python code/fit_polynomial.py --yield-model Yld2000
+python code/fit_polynomial.py --yield-model Yld2000 --smoke-test --output-dir results/polynomial_smoke   # quick check
+```
+
+`--export-fortran` additionally writes the fitted function and its first and second derivatives as
+a Fortran subroutine for use in an implicit finite element solver.
 
 ---
 
@@ -170,6 +250,8 @@ non-quadratic anisotropic yielding:
 ---
 
 ## License
+
+This project is released under the MIT License. See `LICENSE` for details.
 
 ---
 

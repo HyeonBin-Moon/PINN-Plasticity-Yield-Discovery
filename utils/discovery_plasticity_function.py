@@ -168,13 +168,21 @@ def Macro_PINN_train_function(config: dict):
     print(f"[Noise] standard deviation = {noise_mag:.3e} mm")
 
     # ---------------------------------------------------------------- precomputation
+    # Elastic constants and hardening law prescribed in the identification. The defaults are those of the
+    # ground truth; other values are used in the sensitivity study of Appendix F.
+    e_modulus = float(config.get("E_modulus", E_MODULUS))
+    poisson_ratio = float(config.get("poisson_ratio", POISSON_RATIO))
+    hardening_fun = config.get("hardening_fun", hardening_law)
+    print(f"[Material] E = {e_modulus:g} MPa, nu = {poisson_ratio:g}, "
+          f"R(0) = {float(hardening_fun(torch.tensor(0.0))):.4f} MPa")
+
     C_el = torch.zeros((3, 3), dtype=torch.float32, device=device, requires_grad=False)
     C_el[0, 0] = 1.0
     C_el[1, 1] = 1.0
-    C_el[0, 1] = POISSON_RATIO
-    C_el[1, 0] = POISSON_RATIO
-    C_el[2, 2] = (1.0 - POISSON_RATIO) / 2.0
-    C_el *= E_MODULUS / (1.0 - POISSON_RATIO**2)
+    C_el[0, 1] = poisson_ratio
+    C_el[1, 0] = poisson_ratio
+    C_el[2, 2] = (1.0 - poisson_ratio) / 2.0
+    C_el *= e_modulus / (1.0 - poisson_ratio**2)
 
     f = np_to_torch(f_np).to(dtype=torch.long, device=device)
     v = np_to_torch(v)
@@ -277,10 +285,10 @@ def Macro_PINN_train_function(config: dict):
                 PE_leaf = accum_PE.detach().clone().requires_grad_()
 
                 S_trial = S_leaf + dE_t @ C_el.T
-                indicator = torch.sigmoid(beta * (yield_fun(S_trial) - hardening_law(PE_leaf)))
+                indicator = torch.sigmoid(beta * (yield_fun(S_trial) - hardening_fun(PE_leaf)))
 
                 S_eq = yield_fun(S_leaf)
-                R = hardening_law(PE_leaf)
+                R = hardening_fun(PE_leaf)
 
                 use_2nd = (t % second_order_every == 0) or (t == T - 1)
                 grad_S = torch.autograd.grad(S_eq.sum(), S_leaf, create_graph=use_2nd)[0]

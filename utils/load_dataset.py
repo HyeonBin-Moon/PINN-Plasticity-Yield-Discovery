@@ -59,10 +59,12 @@ def get_data_from_inp(inp_file):
 def get_data_from_npz(npz_file, f, B_matrices):
     """Load the FE displacement and reaction force history of one loading case.
 
-    The training data files contain only ``displacements`` and ``rf_bot/top/right/left``
-    (first column: node label, then the x and y components). Files that also contain the
-    stress and state-variable fields written by the FE data extractor are accepted; those
-    fields are returned for validation purposes and are None otherwise.
+    The distributed data files store ``displacements`` and ``rf_bot/top/right/left`` as float32
+    arrays with the x and y components in the last axis (the node labels are given separately in
+    ``node_labels`` and ``nodes_bot/top/right/left``). Files written by the FE data extractor, in
+    which the first column of every array is the node label and which also contain the stress and
+    state-variable fields, are accepted as well; those fields are returned for validation purposes
+    and are None otherwise.
 
     Returns
     -------
@@ -73,11 +75,16 @@ def get_data_from_npz(npz_file, f, B_matrices):
     """
     data = np.load(npz_file)
 
-    disp = data['displacements'][:, :, 1:]
-    bot_rf = data['rf_bot'][:, :, 1:]
-    top_rf = data['rf_top'][:, :, 1:]
-    right_rf = data['rf_right'][:, :, 1:]
-    left_rf = data['rf_left'][:, :, 1:]
+    def components(key):
+        a = data[key]
+        a = a[:, :, 1:] if a.shape[-1] == 3 else a      # drop the node-label column of extractor files
+        return a.astype(np.float64)
+
+    disp = components('displacements')
+    bot_rf = components('rf_bot')
+    top_rf = components('rf_top')
+    right_rf = components('rf_right')
+    left_rf = components('rf_left')
 
     U_temp = np.concatenate((disp[:, f, :][:, :, :, 0], disp[:, f, :][:, :, :, 1]), axis=2)
     E_sol = np.einsum('nij,tnj->tni', B_matrices, U_temp)

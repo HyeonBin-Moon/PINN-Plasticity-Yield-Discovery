@@ -2,8 +2,10 @@
 
 Runs of the paper
 -----------------
-noise    : one identification per benchmark and displacement noise level (0, 0.1, 0.2, 0.3 um), model seed 1
-ensemble : ten identifications per benchmark from the noise-free data with model seeds 1 to 10
+noise       : one identification per benchmark and displacement noise level (0, 0.1, 0.2, 0.3 um), model seed 1
+ensemble    : ten identifications per benchmark from the noise-free data with model seeds 1 to 10
+sensitivity : noise-free identifications with the elastic constants or the hardening law changed one at a time
+              (Appendix F; the paper uses Yld2000-2d). The reference is the noise-free run of the noise study.
 
 Examples
 --------
@@ -11,6 +13,7 @@ python code/train.py --dry-run
 python code/train.py --yield-model VM --study noise --noise 0.0
 python code/train.py --yield-model all --study noise ensemble
 python code/train.py --yield-model Yld2000 --study noise --noise 0.3 --force
+python code/train.py --yield-model Yld2000 --study sensitivity
 
 Outputs (per run): <tag>_model.pth (state dict, loss and beta histories), <tag>_yield_surface.png,
 <tag>_loss_history.png under results/<study>/<model>/<condition>/.
@@ -47,6 +50,22 @@ YIELD_MODEL_LIST = ["VM", "Hill", "Yld2000"]
 NOISE_LEVELS_UM = [0.0, 0.1, 0.2, 0.3]     # displacement noise standard deviation in micrometres
 ENSEMBLE_SEEDS = list(range(1, 11))
 
+
+def sensitivity_cases():
+    """Changed quantities of Appendix F: (tag, config overrides). E and nu in MPa and -, hardening as a callable."""
+    import utils.hardening_variants as hv
+    return [
+        ("E_minus5", {"E_modulus": 0.95 * 69e3}),
+        ("E_plus5", {"E_modulus": 1.05 * 69e3}),
+        ("nu_0.27", {"poisson_ratio": 0.27}),
+        ("nu_0.33", {"poisson_ratio": 0.33}),
+        ("R_x0.95", {"hardening_fun": hv.swift_scaled(0.95)}),
+        ("R_x1.05", {"hardening_fun": hv.swift_scaled(1.05)}),
+        ("n_minus10", {"hardening_fun": hv.swift_exponent(0.9)}),
+        ("n_plus10", {"hardening_fun": hv.swift_exponent(1.1)}),
+        ("voce", {"hardening_fun": hv.voce_fitted_to_swift()}),
+    ]
+
 # Settings of Table 1 of the paper
 BASE_CONFIG = {
     "fem_dataset_path": DATA_PATH,
@@ -81,6 +100,13 @@ def build_run_specs(yield_models, studies, noise_levels_um, seeds):
                 specs.append(dict(study="ensemble", yield_model=yield_model, tag=tag,
                                   save_path=os.path.join(RESULTS_ROOT, "ensemble", yield_model, f"seed_{seed:02d}"),
                                   config={**BASE_CONFIG, "yield_model": yield_model, "noise_mag": 0.0, "model_seed": seed}))
+        if "sensitivity" in studies:
+            for case, overrides in sensitivity_cases():
+                tag = f"{yield_model}_{case}"
+                specs.append(dict(study="sensitivity", yield_model=yield_model, tag=tag,
+                                  save_path=os.path.join(RESULTS_ROOT, "sensitivity", yield_model, case),
+                                  config={**BASE_CONFIG, "yield_model": yield_model, "noise_mag": 0.0, "model_seed": 1,
+                                          **overrides}))
     return specs
 
 
@@ -100,7 +126,8 @@ def run_one(spec, force=False):
     torch.save({"model_state_dict": S_eq_net.state_dict(),
                 "loss_history": loss_history,
                 "beta_history": beta_history,
-                "config": {k: v for k, v in spec["config"].items() if k not in ("yield_model_npz", "yield_model_fun")}},
+                "config": {k: (v.describe() if hasattr(v, "describe") else v) for k, v in spec["config"].items()
+                           if k not in ("yield_model_npz", "yield_model_fun")}},
                model_path)
     plot_yield_comparison(YIELD_MODEL_FUN[yield_model], S_eq_net, hardening_law(0.0), ref_label=yield_model,
                           save_filepath=os.path.join(save_path, f"{tag}_yield_surface.png"))
@@ -115,7 +142,7 @@ def run_one(spec, force=False):
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Neural yield function identification.")
     parser.add_argument("--yield-model", choices=YIELD_MODEL_LIST + ["all"], default="all")
-    parser.add_argument("--study", nargs="+", choices=["noise", "ensemble"], default=["noise"])
+    parser.add_argument("--study", nargs="+", choices=["noise", "ensemble", "sensitivity"], default=["noise"])
     parser.add_argument("--noise", type=float, nargs="+", default=NOISE_LEVELS_UM,
                         help="noise standard deviations in micrometres for the noise study")
     parser.add_argument("--seeds", type=int, nargs="+", default=ENSEMBLE_SEEDS,

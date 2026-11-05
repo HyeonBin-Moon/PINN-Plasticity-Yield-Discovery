@@ -2,8 +2,13 @@
 
 The surrogate is a sum of signed roots of homogeneous polynomials of degrees 2, 4, 6 and 8
 (94 coefficients). It is fitted to 100,000 stress samples on the level set of the neural yield
-function, with 10,000 further samples for validation, using Adam for 20,000 epochs (learning rate
-1e-4, reduced to 1e-5 after 1,000 epochs, gradient norm clipped at 10).
+function, with 10,000 further samples for validation (Algorithm 3 of the paper). The coefficients
+are first optimized with Adam for 20,000 epochs (learning rate 1e-4, reduced to 1e-5 after 1,000
+epochs, gradient norm clipped at 10) without the constraint. They are then projected onto the set of
+SOS-convex polynomials of Eq. (31) and refined by up to 150 Gauss--Newton steps with
+Levenberg--Marquardt damping under the constraint, so that the surrogate is convex
+(utils/sos_convexity.py). The constraint is verified after the fit. --no-convexity-constraint keeps
+the Adam result alone, which corresponds to the unconstrained fit of Appendix D.
 
 Example
 -------
@@ -754,6 +759,57 @@ def fit_polynomial(surface_points, sigma_y, config):
         model=model,
         loss_history=loss_history,
         elapsed_seconds=time.time() - started_at,
+    )
+
+
+def enforce_convexity(fit_result, surface_points, sigma_y, config):
+    """Steps 2 to 11 of Algorithm 3: projection onto the SOS-convex set of Eq. (31) and constrained
+    Gauss--Newton refinement. The coefficients are kept in float64 so that the verified constraint holds
+    for the saved model."""
+    from utils.sos_convexity import SOSConvexFit, monomials   # requires cvxpy and clarabel
+
+    started_at = time.time()
+    model = fit_result.model.double()
+    points = surface_points.detach().cpu().double().numpy() / float(sigma_y)
+    features = monomials(points, model.term_map)
+    adam = {
+        degree: model.coefficients[str(degree)].detach().cpu().double().numpy()
+        for degree in model.degrees
+    }
+    fitter = SOSConvexFit(model.term_map)
+    print("Projecting the Adam result onto the SOS-convex set", flush=True)
+    projected = fitter.project(adam, features)
+    log = [{"stage": "projection", "mse": float(np.mean(fitter.residual(projected, features)[0] ** 2))}]
+    coefficients, log = fitter.gauss_newton(
+        projected,
+        features,
+        max_steps=3 if config.smoke_test else None,
+        log=log,
+    )
+    certificate = fitter.certificate(coefficients)
+    print(f"SOS-convexity verified: {certificate['verified']}", flush=True)
+    with torch.no_grad():
+        for degree in model.degrees:
+            parameter = model.coefficients[str(degree)]
+            parameter.copy_(torch.as_tensor(coefficients[degree], dtype=parameter.dtype, device=parameter.device))
+    sigma2 = float(sigma_y) ** 2
+    convexity = {
+        "constraint": "SOS-convex P_m (Eq. (31))",
+        "gram_margin": fitter.settings["gram_margin"],
+        "gauss_newton_steps_run": sum(1 for entry in log if "relative_decrease" in entry),
+        "training_mse_MPa2_after_projection": sigma2 * log[0]["mse"],
+        "training_mse_MPa2_final": sigma2 * min(entry["mse"] for entry in log if "mse" in entry),
+        "gauss_newton_mse_MPa2": [sigma2 * entry["mse"] for entry in log if "relative_decrease" in entry],
+        "certificate": certificate,
+        "elapsed_seconds": time.time() - started_at,
+    }
+    return (
+        FitResult(
+            model=model,
+            loss_history=fit_result.loss_history,
+            elapsed_seconds=fit_result.elapsed_seconds + convexity["elapsed_seconds"],
+        ),
+        convexity,
     )
 
 
@@ -1572,6 +1628,11 @@ def parse_args(argv=None):
         type=float,
         default=1.0e-10,
     )
+    parser.add_argument(
+        "--no-convexity-constraint",
+        action="store_true",
+        help="keep the unconstrained Adam fit (no SOS-convexity constraint, Appendix D of the paper)",
+    )
     parser.add_argument("--allow-failed-fit", action="store_true")
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--smoke-test", action="store_true")
@@ -1674,6 +1735,11 @@ def main(argv=None):
         offset=config.samples,
     )
     fit_result = fit_polynomial(train_surface, sigma_y, config)
+    if args.no_convexity_constraint:
+        convexity = {"constraint": "none"}
+    else:
+        fit_result, convexity = enforce_convexity(fit_result, train_surface, sigma_y, config)
+        validation_surface = validation_surface.double()
     fit_metrics = evaluate_fit(
         fit_result.model,
         validation_surface,
@@ -1717,6 +1783,7 @@ def main(argv=None):
         "symbolic_parity": symbolic_parity,
         "fit_quality_passed": fit_quality_passed,
         "symbolic_validation_passed": symbolic_passed,
+        "convexity": convexity,
         "training_elapsed_seconds": fit_result.elapsed_seconds,
         "field_validation": {
             "status": "pending" if include_field else "not_requested"

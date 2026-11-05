@@ -50,7 +50,9 @@ The framework consists of three components:
 
 For deployment in conventional implicit finite element analysis, the discovered $C^0$ neural yield
 function is post-processed into a $C^1$-continuous, positively homogeneous **polynomial surrogate**
-composed of terms of degrees 2, 4, 6, and 8.
+composed of terms of degrees 2, 4, 6, and 8. The surrogate is fitted under a **convexity constraint**:
+each homogeneous polynomial $P_m$ is required to be sum-of-squares convex (SOS-convex), so that the
+deployed yield function is also convex.
 
 ---
 
@@ -93,8 +95,11 @@ The data files `data/Data_Inp_<model>_<case>.npz` (`<model>` in `VM`, `Hill`, `Y
 
 | Key | Shape | Content |
 |:--|:--|:--|
-| `displacements` | (101, 4485, 3) | node label, $u_x$, $u_y$ [mm] for the initial state and the 100 sampled increments |
-| `rf_bot`, `rf_top`, `rf_right`, `rf_left` | (101, 68, 3) | node label, reaction force components [N] on the four edges |
+| `displacements` | (101, 4485, 2) | $u_x$, $u_y$ [mm] of every node for the initial state and the 100 sampled increments |
+| `rf_bot`, `rf_top`, `rf_right`, `rf_left` | (101, 68, 2) | reaction force components [N] at the nodes of the four edges |
+| `node_labels`, `nodes_bot`, `nodes_top`, `nodes_right`, `nodes_left` | (4485,), (68,) | Abaqus node labels of the rows above |
+
+The arrays are stored as float32, which is the precision of the finite element output.
 
 Only the total reaction forces on the displacement-controlled boundaries enter the loss. The files
 `data/Inp_<model>_<case>.inp` are the Abaqus input files with the mesh and the edge node sets.
@@ -160,8 +165,20 @@ named above while sharing one set of elastic constants and one hardening law.
 - **Polynomial surrogate.**
   Fitted to 100,000 stress samples drawn on the level set of the discovered neural yield function
   by minimizing the mean squared error against it, with 10,000 further samples for validation
-  (20,000 epochs, Adam, learning rate $10^{-4}$ reduced to $10^{-5}$ after 1,000 epochs, gradient
-  norm clipped at 10).
+  (Algorithm 3 of the paper). The coefficients are first optimized with Adam without the constraint
+  (20,000 epochs, learning rate $10^{-4}$ reduced to $10^{-5}$ after 1,000 epochs, gradient norm
+  clipped at 10). They are then projected onto the SOS-convex set,
+  $\mathbf{y}^T\nabla^2 P_m(\boldsymbol{\sigma})\,\mathbf{y} = \mathbf{z}_m^T\mathbf{G}_m\mathbf{z}_m$
+  with $\mathbf{G}_m \succ \mathbf{0}$, and refined by up to 150 Gauss–Newton steps with
+  Levenberg–Marquardt damping under this semidefinite constraint. The constraint is verified after the
+  fit by recomputing $\mathbf{G}_m$ from the final coefficients.
+
+- **Sensitivity to the elastic constants and the hardening law.**
+  The noise-free Yld2000-2d identification is repeated with one quantity changed at a time: the
+  elastic modulus by $\pm5\%$ (65.55 and 72.45 GPa), Poisson's ratio to 0.27 and 0.33, the hardening
+  law scaled by 0.95 and 1.05, its exponent multiplied by 0.9 and 1.1 ($n = 0.1997$ and $0.2441$)
+  with $R(0)$ unchanged, and a Voce law with $R(0)$ unchanged fitted to the ground-truth hardening law
+  up to the uniform elongation. The finite element data are unchanged (Appendix F of the paper).
 
 ---
 
@@ -169,9 +186,9 @@ named above while sharing one set of elastic constants and one hardening law.
 
 ```text
 code/
-  train.py                      neural yield function identification (noise study and deep ensemble)
+  train.py                      neural yield function identification (noise study, deep ensemble, sensitivity study)
   plot_results.py               yield contours of an identified yield function against the ground truth
-  fit_polynomial.py             polynomial surrogate of an identified yield function
+  fit_polynomial.py             convexity-constrained polynomial surrogate of an identified yield function
 data/
   Data_Inp_<model>_<case>.npz   displacement and reaction force histories (12 files)
   Inp_<model>_<case>.inp        Abaqus input files with the mesh and boundary node sets (12 files)
@@ -179,6 +196,8 @@ utils/
   ai_model.py                   convex neural network (SymmetricICNN) and the polynomial surrogate model
   discovery_plasticity_function.py   differentiable stress update, force equilibrium loss, training loop
   bench_models.py               benchmark yield functions and the hardening law
+  hardening_variants.py         changed hardening laws of the sensitivity study
+  sos_convexity.py              SOS-convexity constraint, constrained Gauss–Newton fit, and its verification
   load_dataset.py               readers for the mesh and the data files
   spatiotemporal_noise.py       spatiotemporally correlated displacement noise
   beta_scheduler.py             sharpness schedule of the sigmoid plasticity indicator
@@ -193,9 +212,11 @@ utils/
 pip install -r requirements.txt
 ```
 
-Python 3.9 or later with NumPy, SciPy, Matplotlib, PyTorch, and SymPy (used only by
-`fit_polynomial.py`). A CUDA GPU is recommended: one identification (2,000 epochs) takes about
+Python 3.9 or later with NumPy, SciPy, Matplotlib, PyTorch, SymPy, and CVXPY with the Clarabel
+solver (SymPy and CVXPY are used only by `fit_polynomial.py`). A CUDA GPU is recommended: one identification (2,000 epochs) takes about
 50 minutes on an NVIDIA RTX 4090 and needs about 19 GB of GPU memory with the default settings.
+Without a GPU the scripts run on the CPU (about 40 s per epoch, that is, roughly a day per
+identification).
 
 ---
 
@@ -211,6 +232,7 @@ python code/train.py --dry-run                                   # list the plan
 python code/train.py --yield-model VM --study noise --noise 0.0   # one noise-free identification
 python code/train.py --yield-model all --study noise              # noise study: 3 benchmarks x 4 noise levels
 python code/train.py --yield-model all --study ensemble           # deep ensemble: 3 benchmarks x seeds 1 to 10
+python code/train.py --yield-model Yld2000 --study sensitivity    # elastic constants and hardening law changed (9 runs)
 ```
 
 Each run writes `results/<study>/<model>/<condition>/<tag>_model.pth` (network parameters, loss and
@@ -230,8 +252,10 @@ python code/fit_polynomial.py --yield-model Yld2000
 python code/fit_polynomial.py --yield-model Yld2000 --smoke-test --output-dir results/polynomial_smoke   # quick check
 ```
 
-`--export-fortran` additionally writes the fitted function and its first and second derivatives as
-a Fortran subroutine for use in an implicit finite element solver.
+The fit applies the convexity constraint by default and reports the verification of the constraint
+in the metrics file. `--no-convexity-constraint` keeps the unconstrained Adam fit. `--export-fortran`
+additionally writes the fitted function and its first and second derivatives as a Fortran subroutine
+for use in an implicit finite element solver.
 
 ---
 
